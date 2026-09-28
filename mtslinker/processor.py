@@ -1,5 +1,6 @@
 import logging
 import os
+import subprocess
 from typing import Dict, Tuple, List, Union
 
 import numpy as np
@@ -125,8 +126,98 @@ def create_audio_with_gaps(total_duration: float, audio_clips: List[AudioFileCli
     return final_audio
 
 
+def compile_final_video_ffmpeg(
+    total_duration: float,
+    video_clips: List[VideoFileClip],
+    audio_clips: List[AudioFileClip],
+    output_path: str,
+) -> None:
+    """Render the timeline in ffmpeg without a Python frame-generation loop."""
+    if not video_clips:
+        raise ValueError('No video clips available for ffmpeg rendering.')
+
+    width, height = video_clips[0].size
+    command = ['ffmpeg', '-y', '-loglevel', 'warning']
+    for clip in [*video_clips, *audio_clips]:
+        filename = getattr(clip, 'filename', None)
+        if not filename:
+            raise ValueError('A clip has no source filename for ffmpeg rendering.')
+        command.extend(['-i', filename])
+
+    filters = []
+    video_labels = []
+    current_time = 0.0
+    for index, clip in enumerate(video_clips):
+        start = float(clip.start or 0)
+        gap = start - current_time
+        if gap > 0:
+            label = f'vgap{index}'
+            filters.append(
+                f'color=c=black:s={width}x{height}:r={TARGET_FPS}:d={gap},format=yuv420p[{label}]'
+            )
+            video_labels.append(f'[{label}]')
+        label = f'v{index}'
+        filters.append(
+            f'[{index}:v]scale={width}:{height}:force_original_aspect_ratio=decrease,'
+            f'pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,fps={TARGET_FPS},'
+            f'format=yuv420p,setpts=PTS-STARTPTS[{label}]'
+        )
+        video_labels.append(f'[{label}]')
+        current_time = max(current_time, start) + float(clip.duration)
+
+    if current_time < total_duration:
+        label = 'vgap_end'
+        filters.append(
+            f'color=c=black:s={width}x{height}:r={TARGET_FPS}:d={total_duration - current_time},'
+            f'format=yuv420p[{label}]'
+        )
+        video_labels.append(f'[{label}]')
+
+    filters.append(''.join(video_labels) + f'concat=n={len(video_labels)}:v=1:a=0[vout]')
+    output_options = ['-map', '[vout]']
+
+    if audio_clips:
+        audio_labels = []
+        video_count = len(video_clips)
+        for index, clip in enumerate(audio_clips):
+            input_index = video_count + index
+            delay_ms = max(0, round(float(clip.start or 0) * 1000))
+            label = f'a{index}'
+            filters.append(
+                f'[{input_index}:a]aresample={TARGET_AUDIO_FPS},asetpts=PTS-STARTPTS,'
+                f'adelay={delay_ms}|{delay_ms}[{label}]'
+            )
+            audio_labels.append(f'[{label}]')
+        filters.append(
+            ''.join(audio_labels) + f'amix=inputs={len(audio_labels)}:duration=longest:dropout_transition=0,'
+            f'apad=whole_dur={total_duration},atrim=duration={total_duration},'
+            f'aresample={TARGET_AUDIO_FPS}[aout]'
+        )
+        output_options.extend(['-map', '[aout]', '-c:a', 'aac', '-b:a', '192k'])
+    else:
+        output_options.append('-an')
+
+    command.extend([
+        '-filter_complex', ';'.join(filters),
+        *output_options,
+        '-c:v', 'libx264', '-preset', 'ultrafast', '-r', str(TARGET_FPS),
+        '-t', str(total_duration), output_path,
+    ])
+    subprocess.run(command, check=True)
+
+
 def compile_final_video(total_duration: float, video_clips: List[VideoFileClip], audio_clips: List[AudioFileClip],
                         output_path: str, max_duration: Union[int, None]):
+    if max_duration:
+        total_duration = min(total_duration, max_duration)
+
+    try:
+        compile_final_video_ffmpeg(total_duration, video_clips, audio_clips, output_path)
+        logging.info('Final video rendered with ffmpeg.')
+        return
+    except (OSError, ValueError, subprocess.CalledProcessError) as error:
+        logging.warning('ffmpeg fast path failed (%s); falling back to MoviePy.', error)
+
     video_result = create_video_with_gaps(total_duration, video_clips)
 
     if audio_clips:
