@@ -157,11 +157,13 @@ def compile_final_video_ffmpeg(
             )
             video_labels.append(f'[{label}]')
         label = f'v{index}'
-        filters.append(
-            f'[{index}:v]scale={width}:{height}:force_original_aspect_ratio=decrease,'
-            f'pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,fps={TARGET_FPS},'
-            f'format=yuv420p,setpts=PTS-STARTPTS[{label}]'
-        )
+        video_filter = f'fps={TARGET_FPS},format=yuv420p,setpts=PTS-STARTPTS'
+        if tuple(clip.size) != (width, height):
+            video_filter = (
+                f'scale={width}:{height}:force_original_aspect_ratio=decrease,'
+                f'pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,' + video_filter
+            )
+        filters.append(f'[{index}:v]{video_filter}[{label}]')
         video_labels.append(f'[{label}]')
         current_time = max(current_time, start) + float(clip.duration)
 
@@ -201,6 +203,7 @@ def compile_final_video_ffmpeg(
         '-filter_complex', ';'.join(filters),
         *output_options,
         '-c:v', 'libx264', '-preset', 'ultrafast', '-r', str(TARGET_FPS),
+        '-threads', str(os.cpu_count() or 1), '-stats_period', '5', '-loglevel', 'info',
         '-t', str(total_duration), output_path,
     ])
     subprocess.run(command, check=True)
