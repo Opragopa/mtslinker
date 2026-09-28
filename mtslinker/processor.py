@@ -83,7 +83,14 @@ def create_video_with_gaps(total_duration: float, video_clips: List[VideoFileCli
         empty_clip = ColorClip(size=(1920, 1080), color=(0, 0, 0), duration=remaining_duration).with_start(current_time)
         clips.append(empty_clip)
 
-    final_video = concatenate_videoclips(clips, method='compose')
+    # ``compose`` composites every frame onto a canvas and is considerably
+    # slower. All clips produced by MTS Link normally have the same size, so
+    # use the direct frame chain in that case and retain compose as a safe
+    # fallback for recordings with mixed resolutions.
+    clip_sizes = {tuple(clip.size) for clip in clips}
+    concat_method = 'chain' if len(clip_sizes) == 1 else 'compose'
+    logging.info('Concatenating %d clips with method=%s.', len(clips), concat_method)
+    final_video = concatenate_videoclips(clips, method=concat_method)
     logging.info(f'Final video duration: {final_video.duration}')
     return final_video
 
