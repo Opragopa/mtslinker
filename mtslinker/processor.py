@@ -4,6 +4,7 @@ import subprocess
 from typing import Dict, Tuple, List, Union
 
 import numpy as np
+import tqdm
 from moviepy.audio.AudioClip import AudioArrayClip, CompositeAudioClip
 from moviepy.audio.io.AudioFileClip import AudioFileClip
 from moviepy.video.VideoClip import ColorClip
@@ -137,7 +138,7 @@ def compile_final_video_ffmpeg(
         raise ValueError('No video clips available for ffmpeg rendering.')
 
     width, height = video_clips[0].size
-    command = ['ffmpeg', '-y', '-loglevel', 'warning']
+    command = ['ffmpeg', '-y', '-loglevel', 'error']
     for clip in [*video_clips, *audio_clips]:
         filename = getattr(clip, 'filename', None)
         if not filename:
@@ -203,10 +204,37 @@ def compile_final_video_ffmpeg(
         '-filter_complex', ';'.join(filters),
         *output_options,
         '-c:v', 'libx264', '-preset', 'ultrafast', '-r', str(TARGET_FPS),
-        '-threads', str(os.cpu_count() or 1), '-stats_period', '5', '-loglevel', 'info',
+        '-threads', str(os.cpu_count() or 1), '-nostats', '-progress', 'pipe:1',
         '-t', str(total_duration), output_path,
     ])
-    subprocess.run(command, check=True)
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+    )
+    progress = tqdm.tqdm(
+        total=total_duration,
+        unit='s',
+        desc='Rendering',
+        unit_scale=True,
+        bar_format='{l_bar}{bar}| {n:.0f}/{total:.0f}s [{elapsed}<{remaining}, {rate_fmt}]',
+    )
+    last_time = 0.0
+    for line in process.stdout or []:
+        if line.startswith(('out_time_us=', 'out_time_ms=')):
+            value = float(line.split('=', 1)[1])
+            current_time = value / 1_000_000
+            progress.update(max(0.0, min(current_time, total_duration) - last_time))
+            last_time = min(current_time, total_duration)
+        elif line.strip() == 'progress=end':
+            progress.update(max(0.0, total_duration - last_time))
+    process.wait()
+    progress.close()
+    error_output = process.stderr.read() if process.stderr else ''
+    if process.returncode:
+        raise subprocess.CalledProcessError(process.returncode, command, output=error_output)
 
 
 def compile_final_video(total_duration: float, video_clips: List[VideoFileClip], audio_clips: List[AudioFileClip],
