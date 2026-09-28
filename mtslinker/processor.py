@@ -14,6 +14,16 @@ warnings.simplefilter("ignore")
 
 from mtslinker.downloader import download_video_chunk
 
+TARGET_FPS = 30
+TARGET_AUDIO_FPS = 44100
+
+
+def _set_clip_fps(clip, fps):
+    """Set a clip's sampling rate using the API available in MoviePy 1 or 2."""
+    if hasattr(clip, 'with_fps'):
+        return clip.with_fps(fps)
+    return clip.set_fps(fps)
+
 
 def process_video_clips(directory: str, json_data: Dict) -> Tuple[float, List[VideoFileClip], List[AudioFileClip]]:
     total_duration = float(json_data.get('duration', 0))
@@ -32,10 +42,12 @@ def process_video_clips(directory: str, json_data: Dict) -> Tuple[float, List[Vi
 
                 downloaded_file_path = download_video_chunk(url, directory)
                 try:
-                    video_clip = VideoFileClip(downloaded_file_path, fps_source='fps').with_start(start_time)
+                    video_clip = _set_clip_fps(VideoFileClip(downloaded_file_path, fps_source='fps'), TARGET_FPS)
+                    video_clip = video_clip.with_start(start_time)
                     video_clips.append(video_clip)
                 except (KeyError, OSError):
-                    audio_clip = AudioFileClip(downloaded_file_path).with_start(start_time)
+                    audio_clip = _set_clip_fps(AudioFileClip(downloaded_file_path), TARGET_AUDIO_FPS)
+                    audio_clip = audio_clip.with_start(start_time)
                     audio_clips.append(audio_clip)
     logging.info(f'Total duration of clips: {total_duration}')
 
@@ -75,8 +87,10 @@ def create_audio_with_gaps(total_duration: float, audio_clips: List[AudioFileCli
         if audio.start > current_time:
             gap_duration = audio.start - current_time
             if gap_duration > 0:
-                silence_segment = AudioArrayClip(np.zeros((int(gap_duration * 8000), 2)), fps=8000).with_start(
-                    current_time)
+                silence_segment = AudioArrayClip(
+                    np.zeros((int(gap_duration * TARGET_AUDIO_FPS), 2), dtype=np.float32),
+                    fps=TARGET_AUDIO_FPS
+                ).with_start(current_time)
                 audio_segments.append(silence_segment)
 
         audio_segments.append(audio)
@@ -84,8 +98,10 @@ def create_audio_with_gaps(total_duration: float, audio_clips: List[AudioFileCli
 
     if current_time < total_duration:
         remaining_duration = total_duration - current_time
-        silence_segment = AudioArrayClip(np.zeros((int(remaining_duration * 8000), 2)), fps=8000).with_start(
-            current_time)
+        silence_segment = AudioArrayClip(
+            np.zeros((int(remaining_duration * TARGET_AUDIO_FPS), 2), dtype=np.float32),
+            fps=TARGET_AUDIO_FPS
+        ).with_start(current_time)
         audio_segments.append(silence_segment)
 
     final_audio = CompositeAudioClip(audio_segments)
@@ -110,6 +126,7 @@ def compile_final_video(total_duration: float, video_clips: List[VideoFileClip],
         output_path,
         codec='libx264',
         audio_codec='aac',
+        fps=TARGET_FPS,
         preset='ultrafast',
         threads=os.cpu_count()
     )
