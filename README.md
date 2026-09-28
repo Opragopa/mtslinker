@@ -31,6 +31,11 @@ mtslinker https://my.mts-link.ru/12345678/987654321/record-new/123456789
 mtslinker https://my.mts-link.ru/12345678/987654321/record-new/123456789/record-file/1234567890 --session-id a1b2c3d4
 ```
 
+Фрагменты записи скачиваются параллельно восемью потоками. Число потоков можно изменить:
+```bash
+mtslinker https://my.mts-link.ru/12345678/987654321/record-new/123456789 --download-workers 4
+```
+
 > **Примечание**: Узнать свой `sessionId` можно в кукисах сайта (нужно быть авторизованным). [Пример](https://raw.githubusercontent.com/motattack/mtslinker/refs/heads/master/get_sessionId.mp4) как это можно сделать.
 
 ## Использование в проекте

@@ -19,6 +19,12 @@ def parse_arguments():
         '--session-id',
         help='[Optional] sessionId token for accessing private recordings.'
     )
+    parser.add_argument(
+        '--download-workers',
+        type=int,
+        default=8,
+        help='Number of recording fragments to download concurrently (default: 8).'
+    )
     return parser.parse_args()
 
 def extract_ids_from_url(url: str):
@@ -51,7 +57,8 @@ def main():
     if fetch_webinar_data(
     event_sessions=event_sessions,
         record_id=record_id,
-        session_id=args.session_id
+        session_id=args.session_id,
+        download_workers=args.download_workers,
     ):
         logging.info('Download completed.')
 

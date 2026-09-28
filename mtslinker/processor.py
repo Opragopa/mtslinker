@@ -12,7 +12,7 @@ import warnings
 warnings.simplefilter("ignore")
 
 
-from mtslinker.downloader import download_video_chunk
+from mtslinker.downloader import download_video_chunks
 
 TARGET_FPS = 30
 TARGET_AUDIO_FPS = 44100
@@ -25,13 +25,18 @@ def _set_clip_fps(clip, fps):
     return clip.set_fps(fps)
 
 
-def process_video_clips(directory: str, json_data: Dict) -> Tuple[float, List[VideoFileClip], List[AudioFileClip]]:
+def process_video_clips(
+    directory: str,
+    json_data: Dict,
+    download_workers: int = 8,
+) -> Tuple[float, List[VideoFileClip], List[AudioFileClip]]:
     total_duration = float(json_data.get('duration', 0))
     if not total_duration:
         raise ValueError('Duration not found in JSON data.')
 
     video_clips = []
     audio_clips = []
+    events = []
 
     for event in json_data.get('eventLogs', []):
         if isinstance(event, dict):
@@ -39,16 +44,20 @@ def process_video_clips(directory: str, json_data: Dict) -> Tuple[float, List[Vi
             if isinstance(data, dict) and 'url' in data:
                 url = data['url']
                 start_time = event.get('relativeTime', 0)
+                events.append((url, start_time))
 
-                downloaded_file_path = download_video_chunk(url, directory)
-                try:
-                    video_clip = _set_clip_fps(VideoFileClip(downloaded_file_path, fps_source='fps'), TARGET_FPS)
-                    video_clip = video_clip.with_start(start_time)
-                    video_clips.append(video_clip)
-                except (KeyError, OSError):
-                    audio_clip = _set_clip_fps(AudioFileClip(downloaded_file_path), TARGET_AUDIO_FPS)
-                    audio_clip = audio_clip.with_start(start_time)
-                    audio_clips.append(audio_clip)
+    downloaded_paths = download_video_chunks(
+        (url for url, _ in events), directory, max_workers=download_workers
+    )
+    for downloaded_file_path, (_, start_time) in zip(downloaded_paths, events):
+        try:
+            video_clip = _set_clip_fps(VideoFileClip(downloaded_file_path, fps_source='fps'), TARGET_FPS)
+            video_clip = video_clip.with_start(start_time)
+            video_clips.append(video_clip)
+        except (KeyError, OSError):
+            audio_clip = _set_clip_fps(AudioFileClip(downloaded_file_path), TARGET_AUDIO_FPS)
+            audio_clip = audio_clip.with_start(start_time)
+            audio_clips.append(audio_clip)
     logging.info(f'Total duration of clips: {total_duration}')
 
     return total_duration, video_clips, audio_clips

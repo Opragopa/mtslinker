@@ -7,7 +7,7 @@ from mtslinker.processor import compile_final_video, process_video_clips
 from mtslinker.utils import create_directory_if_not_exists
 
 
-def fetch_webinar_data(event_sessions: str, record_id: str, session_id=None, max_duration=None):
+def fetch_webinar_data(event_sessions: str, record_id: str, session_id=None, max_duration=None, download_workers=8):
     json_data_url = construct_json_data_url(event_session_id=event_sessions, recording_id=record_id)
     json_data = fetch_json_data(url=json_data_url, session_id=session_id)
     
@@ -19,7 +19,9 @@ def fetch_webinar_data(event_sessions: str, record_id: str, session_id=None, max
     directory = create_directory_if_not_exists(sanitized_name)
     output_video_path = os.path.join(directory, f'{sanitized_name}.mp4')
 
-    total_duration, video_clips, audio_clips = process_video_clips(directory, json_data)
+    total_duration, video_clips, audio_clips = process_video_clips(
+        directory, json_data, download_workers=download_workers
+    )
     logging.info(
         f'Downloaded and processed {len(video_clips) + len(audio_clips)} files ({total_duration} sec) for merging.')
 
