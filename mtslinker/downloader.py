@@ -3,7 +3,6 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, Iterable, List, Union
 
 import httpx
-import tqdm
 import logging
 
 TIMEOUT_SETTINGS = httpx.Timeout(None, connect=None)
@@ -52,17 +51,18 @@ def download_video_chunk(video_url: str, save_directory: str) -> str:
     filename = os.path.basename(video_url)
     file_path = os.path.join(save_directory, filename)
 
-    if not os.path.exists(file_path):
-        with open(file_path, 'wb') as file:
-            with httpx.Client(timeout=TIMEOUT_SETTINGS) as client:
-                with client.stream('GET', video_url) as response:
-                    response.raise_for_status()
-                    total_size = int(response.headers.get('content-length', 0))
-                    with tqdm.tqdm(total=total_size, unit='B', unit_scale=True,
-                                   desc=f'Downloading {filename}') as progress:
-                        for chunk in response.iter_bytes(chunk_size=8192):
-                            file.write(chunk)
-                            progress.update(len(chunk))
+    if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
+        logging.info('Using existing fragment: %s', filename)
+        return file_path
+
+    logging.info('Downloading fragment: %s', filename)
+    with open(file_path, 'wb') as file:
+        with httpx.Client(timeout=TIMEOUT_SETTINGS) as client:
+            with client.stream('GET', video_url) as response:
+                response.raise_for_status()
+                for chunk in response.iter_bytes(chunk_size=8192):
+                    file.write(chunk)
+    logging.info('Downloaded fragment: %s (%.1f MB)', filename, os.path.getsize(file_path) / 1024**2)
     return file_path
 
 

@@ -3,7 +3,6 @@ import json
 import os
 import platform
 import subprocess
-from functools import lru_cache
 from typing import Dict, Tuple, List, Union
 
 import numpy as np
@@ -22,6 +21,8 @@ from mtslinker.downloader import download_video_chunks
 TARGET_FPS = 30
 TARGET_AUDIO_FPS = 44100
 AUDIO_LOUDNORM = 'loudnorm=I=-14:TP=-1.0:LRA=11'
+MIN_OUTPUT_VIDEO_BITRATE_KBPS = 450
+MAX_OUTPUT_VIDEO_BITRATE_KBPS = 4000
 
 
 def _set_clip_fps(clip, fps):
@@ -31,8 +32,7 @@ def _set_clip_fps(clip, fps):
     return clip.set_fps(fps)
 
 
-@lru_cache(maxsize=1)
-def _select_video_encoder():
+def _select_video_encoder(target_bitrate_kbps):
     """Select an available hardware encoder, falling back to libx264."""
     try:
         probe = subprocess.run(
@@ -61,9 +61,28 @@ def _select_video_encoder():
             check=False,
         )
         if test.returncode == 0:
+            target = f'{target_bitrate_kbps}k'
+            options = [*options, '-b:v', target, '-maxrate', target,
+                       '-bufsize', f'{target_bitrate_kbps * 2}k']
             return encoder, options
         logging.warning('%s is listed but unavailable; using CPU encoding.', encoder)
-    return 'libx264', ['-preset', 'ultrafast']
+    return 'libx264', [
+        '-preset', 'ultrafast', '-b:v', f'{target_bitrate_kbps}k',
+        '-maxrate', f'{target_bitrate_kbps}k', '-bufsize', f'{target_bitrate_kbps * 2}k'
+    ]
+
+
+def _target_video_bitrate_kbps(video_clips):
+    source_bitrates = []
+    for clip in video_clips:
+        reader = getattr(clip, 'reader', None)
+        infos = getattr(reader, 'infos', {}) if reader else {}
+        bitrate = infos.get('video_bitrate')
+        if bitrate:
+            source_bitrates.append(float(bitrate))
+    source_bitrate = max(source_bitrates, default=1000.0)
+    target = round(source_bitrate * 1.5)
+    return max(MIN_OUTPUT_VIDEO_BITRATE_KBPS, min(MAX_OUTPUT_VIDEO_BITRATE_KBPS, target))
 
 
 def _audio_group(stream, fallback_index):
@@ -109,8 +128,11 @@ def process_video_clips(
                 start_time = event.get('relativeTime', 0)
                 events.append((url, start_time, data.get('stream')))
 
+    fragments_directory = os.path.join(directory, 'fragments')
+    os.makedirs(fragments_directory, exist_ok=True)
+    logging.info('Fragment directory: %s', fragments_directory)
     downloaded_paths = download_video_chunks(
-        (url for url, _, _ in events), directory, max_workers=download_workers
+        (url for url, _, _ in events), fragments_directory, max_workers=download_workers
     )
     audio_source_index = 0
     for downloaded_file_path, (_, start_time, stream) in zip(downloaded_paths, events):
@@ -198,13 +220,15 @@ def compile_final_video_ffmpeg(
     video_clips: List[VideoFileClip],
     audio_clips: List[AudioFileClip],
     output_path: str,
+    include_multitrack: bool = False,
 ) -> None:
     """Render the timeline in ffmpeg without a Python frame-generation loop."""
     if not video_clips:
         raise ValueError('No video clips available for ffmpeg rendering.')
 
-    video_encoder, encoder_options = _select_video_encoder()
-    logging.info('Using video encoder: %s', video_encoder)
+    target_bitrate_kbps = _target_video_bitrate_kbps(video_clips)
+    video_encoder, encoder_options = _select_video_encoder(target_bitrate_kbps)
+    logging.info('Using video encoder: %s at target bitrate %dkbps', video_encoder, target_bitrate_kbps)
     width, height = video_clips[0].size
     command = ['ffmpeg', '-y', '-loglevel', 'error']
     for clip in [*video_clips, *audio_clips]:
@@ -254,9 +278,13 @@ def compile_final_video_ffmpeg(
             input_index = video_count + index
             delay_ms = max(0, round(float(clip.start or 0) * 1000))
             source_label = f'a{index}'
+            split = (
+                f',asplit=2[{source_label}_master][{source_label}_track]'
+                if include_multitrack else f'[{source_label}_master]'
+            )
             filters.append(
                 f'[{input_index}:a]aresample={TARGET_AUDIO_FPS},asetpts=PTS-STARTPTS,'
-                f'adelay={delay_ms}|{delay_ms},asplit=2[{source_label}_master][{source_label}_track]'
+                f'adelay={delay_ms}|{delay_ms}{split}'
             )
             audio_labels.append(f'[{source_label}_master]')
 
@@ -282,18 +310,19 @@ def compile_final_video_ffmpeg(
             '-map', '[a_master]', '-metadata:s:a:0', 'handler_name=Master',
             '-c:a', 'aac', '-b:a', '192k'
         ])
-        ordered_groups = sorted(
-            groups.items(), key=lambda item: group_labels[item[0]] != 'Лектор'
-        )
-        for track_index, (key, inputs) in enumerate(ordered_groups, start=1):
-            label = f'a_track_{track_index}'
-            add_mix(inputs, label)
-            title = group_labels[key]
-            if title == 'Аудио':
-                title = f'Аудио {track_index + 1}'
-            output_options.extend([
-                '-map', f'[{label}]', '-metadata:s:a:' + str(track_index), f'handler_name={title}'
-            ])
+        if include_multitrack:
+            ordered_groups = sorted(
+                groups.items(), key=lambda item: group_labels[item[0]] != 'Лектор'
+            )
+            for track_index, (key, inputs) in enumerate(ordered_groups, start=1):
+                label = f'a_track_{track_index}'
+                add_mix(inputs, label)
+                title = group_labels[key]
+                if title == 'Аудио':
+                    title = f'Аудио {track_index + 1}'
+                output_options.extend([
+                    '-map', f'[{label}]', '-metadata:s:a:' + str(track_index), f'handler_name={title}'
+                ])
     else:
         output_options.append('-an')
 
@@ -338,12 +367,15 @@ def compile_final_video_ffmpeg(
 
 
 def compile_final_video(total_duration: float, video_clips: List[VideoFileClip], audio_clips: List[AudioFileClip],
-                        output_path: str, max_duration: Union[int, None]):
+                        output_path: str, max_duration: Union[int, None], include_multitrack: bool = False):
     if max_duration:
         total_duration = min(total_duration, max_duration)
 
     try:
-        compile_final_video_ffmpeg(total_duration, video_clips, audio_clips, output_path)
+        compile_final_video_ffmpeg(
+            total_duration, video_clips, audio_clips, output_path,
+            include_multitrack=include_multitrack,
+        )
         logging.info('Final video rendered with ffmpeg.')
         return
     except (OSError, ValueError, subprocess.CalledProcessError) as error:
