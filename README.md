@@ -76,6 +76,26 @@ cd mtslinker
 python3 -m pip install -e .
 ```
 
+Запуск записи:
+
+```bash
+mtslinker "RECORD_URL"
+```
+
+Для закрытой записи добавьте `--session-id`. Отдельные дорожки спикеров включаются только явно:
+
+```bash
+mtslinker "RECORD_URL" --multitrack
+```
+
+На Windows после обновления клона из основной ветки:
+
+```powershell
+git pull --ff-only origin main
+python -m pip install -e .
+python -m mtslinker.cli "RECORD_URL"
+```
+
 Для обновления уже установленной editable-версии:
 
 ```bash
