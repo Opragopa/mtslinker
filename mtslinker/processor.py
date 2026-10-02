@@ -18,6 +18,7 @@ from mtslinker.downloader import download_video_chunks
 
 TARGET_FPS = 30
 TARGET_AUDIO_FPS = 44100
+AUDIO_LOUDNORM = 'loudnorm=I=-14:TP=-1.0:LRA=11'
 
 
 def _set_clip_fps(clip, fps):
@@ -193,7 +194,8 @@ def compile_final_video_ffmpeg(
             audio_labels.append(f'[{label}]')
         filters.append(
             ''.join(audio_labels) + f'amix=inputs={len(audio_labels)}:duration=longest:dropout_transition=0,'
-            f'apad=whole_dur={total_duration},atrim=duration={total_duration},'
+            f'apad=whole_dur={total_duration},{AUDIO_LOUDNORM},'
+            f'atrim=duration={total_duration},'
             f'aresample={TARGET_AUDIO_FPS}[aout]'
         )
         output_options.extend(['-map', '[aout]', '-c:a', 'aac', '-b:a', '192k'])
@@ -266,5 +268,6 @@ def compile_final_video(total_duration: float, video_clips: List[VideoFileClip],
         audio_codec='aac',
         fps=TARGET_FPS,
         preset='ultrafast',
-        threads=os.cpu_count()
+        threads=os.cpu_count(),
+        ffmpeg_params=['-af', AUDIO_LOUDNORM],
     )
