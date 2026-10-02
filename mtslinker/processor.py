@@ -18,7 +18,9 @@ warnings.simplefilter("ignore")
 
 from mtslinker.downloader import download_video_chunks
 
-TARGET_FPS = 30
+# 25 FPS is sufficient for lectures and screen recordings and reduces the
+# number of frames that must be filtered and encoded.
+TARGET_FPS = 25
 TARGET_AUDIO_FPS = 44100
 AUDIO_LOUDNORM = 'loudnorm=I=-14:TP=-1.0:LRA=11'
 MIN_OUTPUT_VIDEO_BITRATE_KBPS = 450
@@ -54,7 +56,7 @@ def _select_video_encoder(target_bitrate_kbps):
     if platform.system() == 'Darwin' and 'h264_videotoolbox' in encoders:
         candidates.append(('h264_videotoolbox', ['-pix_fmt', 'yuv420p']))
     if 'h264_nvenc' in encoders:
-        candidates.append(('h264_nvenc', ['-preset', 'p4', '-pix_fmt', 'yuv420p']))
+        candidates.append(('h264_nvenc', ['-preset', 'p2', '-pix_fmt', 'yuv420p']))
     for encoder, options in candidates:
         test = subprocess.run(
             [
