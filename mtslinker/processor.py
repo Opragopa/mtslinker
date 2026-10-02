@@ -1,7 +1,9 @@
 import logging
 import json
 import os
+import platform
 import subprocess
+from functools import lru_cache
 from typing import Dict, Tuple, List, Union
 
 import numpy as np
@@ -27,6 +29,41 @@ def _set_clip_fps(clip, fps):
     if hasattr(clip, 'with_fps'):
         return clip.with_fps(fps)
     return clip.set_fps(fps)
+
+
+@lru_cache(maxsize=1)
+def _select_video_encoder():
+    """Select an available hardware encoder, falling back to libx264."""
+    try:
+        probe = subprocess.run(
+            ['ffmpeg', '-hide_banner', '-encoders'],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        encoders = probe.stdout + probe.stderr
+    except OSError:
+        encoders = ''
+
+    candidates = []
+    if platform.system() == 'Darwin' and 'h264_videotoolbox' in encoders:
+        candidates.append(('h264_videotoolbox', ['-b:v', '6M']))
+    if 'h264_nvenc' in encoders:
+        candidates.append(('h264_nvenc', ['-preset', 'p4', '-rc', 'vbr', '-cq', '23', '-b:v', '0']))
+    for encoder, options in candidates:
+        test = subprocess.run(
+            [
+                'ffmpeg', '-hide_banner', '-loglevel', 'error', '-f', 'lavfi',
+                '-i', 'color=c=black:s=128x128:r=30:d=0.1', '-c:v', encoder,
+                *options, '-f', 'null', '-'
+            ],
+            capture_output=True,
+            check=False,
+        )
+        if test.returncode == 0:
+            return encoder, options
+        logging.warning('%s is listed but unavailable; using CPU encoding.', encoder)
+    return 'libx264', ['-preset', 'ultrafast']
 
 
 def _audio_group(stream, fallback_index):
@@ -166,6 +203,8 @@ def compile_final_video_ffmpeg(
     if not video_clips:
         raise ValueError('No video clips available for ffmpeg rendering.')
 
+    video_encoder, encoder_options = _select_video_encoder()
+    logging.info('Using video encoder: %s', video_encoder)
     width, height = video_clips[0].size
     command = ['ffmpeg', '-y', '-loglevel', 'error']
     for clip in [*video_clips, *audio_clips]:
@@ -261,7 +300,7 @@ def compile_final_video_ffmpeg(
     command.extend([
         '-filter_complex', ';'.join(filters),
         *output_options,
-        '-c:v', 'libx264', '-preset', 'ultrafast', '-r', str(TARGET_FPS),
+        '-c:v', video_encoder, *encoder_options, '-pix_fmt', 'yuv420p', '-r', str(TARGET_FPS),
         '-threads', str(os.cpu_count() or 1), '-nostats', '-progress', 'pipe:1',
         '-t', str(total_duration), output_path,
     ])
@@ -282,7 +321,10 @@ def compile_final_video_ffmpeg(
     last_time = 0.0
     for line in process.stdout or []:
         if line.startswith(('out_time_us=', 'out_time_ms=')):
-            value = float(line.split('=', 1)[1])
+            raw_value = line.split('=', 1)[1].strip()
+            if raw_value == 'N/A':
+                continue
+            value = float(raw_value)
             current_time = value / 1_000_000
             progress.update(max(0.0, min(current_time, total_duration) - last_time))
             last_time = min(current_time, total_duration)

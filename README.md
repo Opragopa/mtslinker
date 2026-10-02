@@ -39,6 +39,24 @@ mtslinker RECORD_URL --download-workers 8
 
 Если ffmpeg не может обработать исходные файлы, автоматически используется fallback через MoviePy.
 
+## Аппаратное кодирование
+
+При наличии поддержки в установленном ffmpeg форк автоматически выбирает:
+
+- Apple VideoToolbox на macOS;
+- `h264_nvenc` на компьютерах с NVIDIA RTX;
+- `libx264`, если аппаратный кодировщик недоступен.
+
+На Windows проверьте NVIDIA и ffmpeg так:
+
+```powershell
+nvidia-smi
+ffmpeg -hide_banner -encoders | findstr /i "h264_nvenc hevc_nvenc"
+ffmpeg -hide_banner -f lavfi -i color=c=black:s=128x128:r=30:d=1 -c:v h264_nvenc -f null NUL
+```
+
+Если третья команда завершается с кодом `0`, NVENC реально доступен. Сам `mtslinker` также выполняет короткую проверку и автоматически переключается на CPU, если кодировщик только заявлен в ffmpeg, но не работает с текущим драйвером.
+
 ## Локальная установка форка
 
 ```bash
