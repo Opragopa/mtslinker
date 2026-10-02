@@ -1,4 +1,5 @@
 import logging
+import json
 import os
 import subprocess
 from typing import Dict, Tuple, List, Union
@@ -28,6 +29,28 @@ def _set_clip_fps(clip, fps):
     return clip.set_fps(fps)
 
 
+def _audio_group(stream, fallback_index):
+    """Return a stable source key and a human-readable track label."""
+    if isinstance(stream, dict):
+        for stream_type in ('conference', 'screensharing'):
+            if stream_type not in stream:
+                continue
+            value = stream[stream_type]
+            if isinstance(value, dict):
+                identity = next(
+                    (value.get(name) for name in ('id', 'streamId', 'participantId', 'userId') if value.get(name)),
+                    None,
+                )
+            else:
+                identity = value
+            if identity is not None:
+                key = f'{stream_type}:{identity}'
+            else:
+                key = f'{stream_type}:{json.dumps(value, sort_keys=True, ensure_ascii=False)}'
+            return key, 'Лектор' if stream_type == 'conference' else 'Трансляция экрана'
+    return f'audio-source-{fallback_index}', 'Аудио'
+
+
 def process_video_clips(
     directory: str,
     json_data: Dict,
@@ -47,12 +70,13 @@ def process_video_clips(
             if isinstance(data, dict) and 'url' in data:
                 url = data['url']
                 start_time = event.get('relativeTime', 0)
-                events.append((url, start_time))
+                events.append((url, start_time, data.get('stream')))
 
     downloaded_paths = download_video_chunks(
-        (url for url, _ in events), directory, max_workers=download_workers
+        (url for url, _, _ in events), directory, max_workers=download_workers
     )
-    for downloaded_file_path, (_, start_time) in zip(downloaded_paths, events):
+    audio_source_index = 0
+    for downloaded_file_path, (_, start_time, stream) in zip(downloaded_paths, events):
         try:
             video_clip = _set_clip_fps(VideoFileClip(downloaded_file_path, fps_source='fps'), TARGET_FPS)
             video_clip = video_clip.with_start(start_time)
@@ -60,6 +84,10 @@ def process_video_clips(
         except (KeyError, OSError):
             audio_clip = _set_clip_fps(AudioFileClip(downloaded_file_path), TARGET_AUDIO_FPS)
             audio_clip = audio_clip.with_start(start_time)
+            group, label = _audio_group(stream, audio_source_index)
+            audio_clip._mts_audio_group = group
+            audio_clip._mts_audio_label = label
+            audio_source_index += 1
             audio_clips.append(audio_clip)
     logging.info(f'Total duration of clips: {total_duration}')
 
@@ -186,19 +214,47 @@ def compile_final_video_ffmpeg(
         for index, clip in enumerate(audio_clips):
             input_index = video_count + index
             delay_ms = max(0, round(float(clip.start or 0) * 1000))
-            label = f'a{index}'
+            source_label = f'a{index}'
             filters.append(
                 f'[{input_index}:a]aresample={TARGET_AUDIO_FPS},asetpts=PTS-STARTPTS,'
-                f'adelay={delay_ms}|{delay_ms}[{label}]'
+                f'adelay={delay_ms}|{delay_ms},asplit=2[{source_label}_master][{source_label}_track]'
             )
-            audio_labels.append(f'[{label}]')
-        filters.append(
-            ''.join(audio_labels) + f'amix=inputs={len(audio_labels)}:duration=longest:dropout_transition=0,'
-            f'apad=whole_dur={total_duration},{AUDIO_LOUDNORM},'
-            f'atrim=duration={total_duration},'
-            f'aresample={TARGET_AUDIO_FPS}[aout]'
+            audio_labels.append(f'[{source_label}_master]')
+
+        groups = {}
+        group_labels = {}
+        for index, clip in enumerate(audio_clips):
+            key = getattr(clip, '_mts_audio_group', f'audio-source-{index}')
+            groups.setdefault(key, []).append(f'[a{index}_track]')
+            group_labels.setdefault(key, getattr(clip, '_mts_audio_label', 'Аудио'))
+
+        def add_mix(inputs, label):
+            mix = ''.join(inputs)
+            if len(inputs) > 1:
+                mix += f'amix=inputs={len(inputs)}:duration=longest:dropout_transition=0,'
+            mix += (
+                f'apad=whole_dur={total_duration},{AUDIO_LOUDNORM},'
+                f'atrim=duration={total_duration},aresample={TARGET_AUDIO_FPS}[{label}]'
+            )
+            filters.append(mix)
+
+        add_mix(audio_labels, 'a_master')
+        output_options.extend([
+            '-map', '[a_master]', '-metadata:s:a:0', 'handler_name=Master',
+            '-c:a', 'aac', '-b:a', '192k'
+        ])
+        ordered_groups = sorted(
+            groups.items(), key=lambda item: group_labels[item[0]] != 'Лектор'
         )
-        output_options.extend(['-map', '[aout]', '-c:a', 'aac', '-b:a', '192k'])
+        for track_index, (key, inputs) in enumerate(ordered_groups, start=1):
+            label = f'a_track_{track_index}'
+            add_mix(inputs, label)
+            title = group_labels[key]
+            if title == 'Аудио':
+                title = f'Аудио {track_index + 1}'
+            output_options.extend([
+                '-map', f'[{label}]', '-metadata:s:a:' + str(track_index), f'handler_name={title}'
+            ])
     else:
         output_options.append('-an')
 
