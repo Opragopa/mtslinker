@@ -45,19 +45,25 @@ def _select_video_encoder(target_bitrate_kbps):
     except OSError:
         encoders = ''
 
+    # Keep the availability probe close to the command users run manually.
+    # In particular, ``-b:v 0`` and the quality-rate-control combination below
+    # can fail on an otherwise working NVENC installation (driver/ffmpeg
+    # builds differ in the supported option set). Bitrate control is added
+    # only after the encoder has passed this minimal initialization test.
     candidates = []
     if platform.system() == 'Darwin' and 'h264_videotoolbox' in encoders:
-        candidates.append(('h264_videotoolbox', ['-b:v', '6M']))
+        candidates.append(('h264_videotoolbox', ['-pix_fmt', 'yuv420p']))
     if 'h264_nvenc' in encoders:
-        candidates.append(('h264_nvenc', ['-preset', 'p4', '-rc', 'vbr', '-cq', '23', '-b:v', '0']))
+        candidates.append(('h264_nvenc', ['-preset', 'p4', '-pix_fmt', 'yuv420p']))
     for encoder, options in candidates:
         test = subprocess.run(
             [
                 'ffmpeg', '-hide_banner', '-loglevel', 'error', '-f', 'lavfi',
-                '-i', 'color=c=black:s=128x128:r=30:d=0.1', '-c:v', encoder,
+                '-i', 'testsrc2=size=1280x720:rate=30', '-t', '1', '-c:v', encoder,
                 *options, '-f', 'null', '-'
             ],
             capture_output=True,
+            text=True,
             check=False,
         )
         if test.returncode == 0:
