@@ -390,25 +390,47 @@ def compile_final_video(total_duration: float, video_clips: List[VideoFileClip],
         logging.info('Final video rendered with ffmpeg.')
         return
     except (OSError, ValueError, subprocess.CalledProcessError) as error:
+        details = getattr(error, 'output', None)
         logging.warning('ffmpeg fast path failed (%s); falling back to MoviePy.', error)
+        if details:
+            logging.warning('ffmpeg fast path diagnostics: %s', str(details).strip())
 
     video_result = create_video_with_gaps(total_duration, video_clips)
 
+    # MoviePy 2 first renders an attached AudioClip to a temporary file and
+    # then invokes ffmpeg with ``-acodec copy``. Applying loudnorm in that
+    # second invocation causes ffmpeg to fail because filters cannot be used
+    # together with stream copy. Normalize the temporary audio while encoding
+    # it, then mux the already-normalized file into the video unchanged.
+    normalized_audio_path = None
     if audio_clips:
         combined_audio = create_audio_with_gaps(total_duration, audio_clips)
-        video_result = video_result.with_audio(combined_audio)
+        normalized_audio_path = output_path + '.normalized.m4a'
+        combined_audio.write_audiofile(
+            normalized_audio_path,
+            fps=TARGET_AUDIO_FPS,
+            codec='aac',
+            bitrate='192k',
+            ffmpeg_params=['-af', AUDIO_LOUDNORM],
+            logger=None,
+        )
 
     if max_duration:
         if video_result.duration > max_duration:
             logging.info(f'Duration limit! Crop!')
             video_result = video_result.subclip(0, max_duration)
 
-    video_result.write_videofile(
-        output_path,
-        codec='libx264',
-        audio_codec='aac',
-        fps=TARGET_FPS,
-        preset='ultrafast',
-        threads=os.cpu_count(),
-        ffmpeg_params=['-af', AUDIO_LOUDNORM],
-    )
+    try:
+        video_result.write_videofile(
+            output_path,
+            codec='libx264',
+            audio=normalized_audio_path or False,
+            audio_codec='copy' if normalized_audio_path else None,
+            fps=TARGET_FPS,
+            preset='ultrafast',
+            threads=os.cpu_count(),
+            logger=None,
+        )
+    finally:
+        if normalized_audio_path and os.path.exists(normalized_audio_path):
+            os.remove(normalized_audio_path)
