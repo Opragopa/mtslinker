@@ -353,10 +353,10 @@ def compile_final_video_ffmpeg(
         unit='s',
         desc='Rendering',
         unit_scale=True,
-        # ``rate_fmt`` can be ``None`` when ffmpeg finishes before tqdm has
-        # enough samples to calculate a rate (notably with Python 3.14/tqdm).
-        # ``!s`` keeps the progress bar closable in that case.
-        bar_format='{l_bar}{bar}| {n:.0f}/{total:.0f}s [{elapsed}<{remaining}, {rate_fmt!s}]',
+        # tqdm on Python 3.14 can expose a ``None`` value while it is closing
+        # the bar. Avoid numeric format specifiers so the final display is
+        # always safe even when one of the progress fields is unavailable.
+        bar_format='{l_bar}{bar}| {n}/{total}s [{elapsed}<{remaining}, {rate_fmt}]',
     )
     last_time = 0.0
     for line in process.stdout or []:
