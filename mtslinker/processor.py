@@ -34,6 +34,36 @@ def _set_clip_fps(clip, fps):
     return clip.set_fps(fps)
 
 
+def _has_video_stream(path):
+    """Return whether ffprobe sees a video stream, or ``None`` if unavailable."""
+    try:
+        probe = subprocess.run(
+            [
+                'ffprobe', '-v', 'error', '-select_streams', 'v:0',
+                '-show_entries', 'stream=codec_type', '-of', 'csv=p=0', path,
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return None
+    if probe.returncode != 0:
+        return None
+    return 'video' in probe.stdout.split()
+
+
+def _open_video_clip(path):
+    """Open a video fragment, tolerating files with incomplete FPS metadata."""
+    try:
+        return VideoFileClip(path, fps_source='fps')
+    except (KeyError, OSError, IndexError, ValueError, TypeError):
+        # Some MTS fragments contain a valid video stream but omit the
+        # ``fps`` field used by MoviePy. ``tbr`` is available in the same
+        # ffmpeg probe and is a safe fallback for those files.
+        return VideoFileClip(path, fps_source='tbr')
+
+
 def _select_video_encoder(target_bitrate_kbps):
     """Select an available hardware encoder, falling back to libx264."""
     try:
@@ -144,11 +174,21 @@ def process_video_clips(
     )
     audio_source_index = 0
     for downloaded_file_path, (_, start_time, stream) in zip(downloaded_paths, events):
+        has_video = _has_video_stream(downloaded_file_path)
+        if has_video is not False:
+            try:
+                video_clip = _set_clip_fps(_open_video_clip(downloaded_file_path), TARGET_FPS)
+                video_clip = video_clip.with_start(start_time)
+                video_clips.append(video_clip)
+                continue
+            except (KeyError, OSError, IndexError, ValueError, TypeError) as error:
+                if has_video:
+                    raise RuntimeError(
+                        f'Video fragment contains a video stream but could not be opened: '
+                        f'{downloaded_file_path}'
+                    ) from error
+
         try:
-            video_clip = _set_clip_fps(VideoFileClip(downloaded_file_path, fps_source='fps'), TARGET_FPS)
-            video_clip = video_clip.with_start(start_time)
-            video_clips.append(video_clip)
-        except (KeyError, OSError):
             audio_clip = _set_clip_fps(AudioFileClip(downloaded_file_path), TARGET_AUDIO_FPS)
             audio_clip = audio_clip.with_start(start_time)
             group, label = _audio_group(stream, audio_source_index)
@@ -156,6 +196,9 @@ def process_video_clips(
             audio_clip._mts_audio_label = label
             audio_source_index += 1
             audio_clips.append(audio_clip)
+        except (KeyError, OSError, IndexError, ValueError, TypeError) as error:
+            logging.warning('Skipping unreadable fragment %s: %s', downloaded_file_path, error)
+    logging.info('Classified fragments: %d video, %d audio.', len(video_clips), len(audio_clips))
     logging.info(f'Total duration of clips: {total_duration}')
 
     return total_duration, video_clips, audio_clips
