@@ -258,12 +258,17 @@ def compile_final_video_ffmpeg(
             )
             video_labels.append(f'[{label}]')
         label = f'v{index}'
-        video_filter = f'fps={TARGET_FPS},format=yuv420p,setpts=PTS-STARTPTS'
-        if tuple(clip.size) != (width, height):
-            video_filter = (
-                f'scale={width}:{height}:force_original_aspect_ratio=decrease,'
-                f'pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,' + video_filter
-            )
+        # Always normalize the decoded stream. MoviePy's ``clip.size`` can
+        # disagree with ffmpeg's actual frame dimensions for rotated or
+        # portrait fragments (for example, metadata may report 640x360 while
+        # the decoder produces 304x540). Conditional scaling then lets a
+        # mismatched stream reach concat and causes filter initialization to
+        # fail. Scaling every input also normalizes SAR before concatenation.
+        video_filter = (
+            f'scale={width}:{height}:force_original_aspect_ratio=decrease,'
+            f'pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,'
+            f'fps={TARGET_FPS},format=yuv420p,setpts=PTS-STARTPTS'
+        )
         filters.append(f'[{index}:v]{video_filter}[{label}]')
         video_labels.append(f'[{label}]')
         current_time = max(current_time, start) + float(clip.duration)
@@ -415,10 +420,15 @@ def compile_final_video(total_duration: float, video_clips: List[VideoFileClip],
             logger=None,
         )
 
-    if max_duration:
-        if video_result.duration > max_duration:
-            logging.info(f'Duration limit! Crop!')
-            video_result = video_result.subclip(0, max_duration)
+    # The MoviePy fallback concatenates decoded clips and can retain a longer
+    # duration when source metadata contains overlapping or rotated streams.
+    # Keep the fallback output on the same timeline as the ffmpeg path.
+    if video_result.duration > total_duration:
+        logging.info('Cropping MoviePy fallback to %.3f seconds.', total_duration)
+        if hasattr(video_result, 'subclipped'):
+            video_result = video_result.subclipped(0, total_duration)
+        else:
+            video_result = video_result.subclip(0, total_duration)
 
     try:
         video_result.write_videofile(
