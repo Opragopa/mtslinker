@@ -23,8 +23,11 @@ from mtslinker.downloader import download_video_chunks
 TARGET_FPS = 25
 TARGET_AUDIO_FPS = 44100
 AUDIO_LOUDNORM = 'loudnorm=I=-14:TP=-1.0:LRA=11'
-MIN_OUTPUT_VIDEO_BITRATE_KBPS = 450
-MAX_OUTPUT_VIDEO_BITRATE_KBPS = 4000
+# 450 kbps is sufficient for a tiny preview, but produces visibly degraded
+# 360p lecture video. The actual floor is selected from the output dimensions
+# below; this is only the absolute safety floor for unknown dimensions.
+MIN_OUTPUT_VIDEO_BITRATE_KBPS = 900
+MAX_OUTPUT_VIDEO_BITRATE_KBPS = 6000
 
 
 def _set_clip_fps(clip, fps):
@@ -120,7 +123,19 @@ def _target_video_bitrate_kbps(video_clips):
             source_bitrates.append(float(bitrate))
     source_bitrate = max(source_bitrates, default=1000.0)
     target = round(source_bitrate * 1.5)
-    return max(MIN_OUTPUT_VIDEO_BITRATE_KBPS, min(MAX_OUTPUT_VIDEO_BITRATE_KBPS, target))
+
+    # Use a resolution-aware floor so a low or missing source bitrate does not
+    # turn a normal lecture recording into a blocky 450 kbps encode.
+    width, height = getattr(video_clips[0], 'size', (0, 0))
+    pixels = int(width or 0) * int(height or 0)
+    if pixels <= 640 * 360:
+        quality_floor = 1200
+    elif pixels <= 1280 * 720:
+        quality_floor = 2500
+    else:
+        quality_floor = 4000
+    quality_floor = max(MIN_OUTPUT_VIDEO_BITRATE_KBPS, quality_floor)
+    return max(quality_floor, min(MAX_OUTPUT_VIDEO_BITRATE_KBPS, target))
 
 
 def _audio_group(stream, fallback_index):
