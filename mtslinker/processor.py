@@ -303,43 +303,39 @@ def compile_final_video_ffmpeg(
             raise ValueError('A clip has no source filename for ffmpeg rendering.')
         command.extend(['-i', filename])
 
-    filters = []
-    video_labels = []
-    current_time = 0.0
+    filters = [
+        f'color=c=black:s={width}x{height}:r={TARGET_FPS}:d={total_duration},'
+        f'format=yuv420p[vcanvas0]'
+    ]
+    canvas_label = 'vcanvas0'
+    overlay_index = 0
     for index, clip in enumerate(video_clips):
         start = float(clip.start or 0)
-        gap = start - current_time
-        if gap > 0:
-            label = f'vgap{index}'
-            filters.append(
-                f'color=c=black:s={width}x{height}:r={TARGET_FPS}:d={gap},format=yuv420p[{label}]'
-            )
-            video_labels.append(f'[{label}]')
+        if start >= total_duration:
+            continue
+        duration = min(float(clip.duration), total_duration - max(0.0, start))
+        if duration <= 0:
+            continue
+
         label = f'v{index}'
-        # Always normalize the decoded stream. MoviePy's ``clip.size`` can
-        # disagree with ffmpeg's actual frame dimensions for rotated or
-        # portrait fragments (for example, metadata may report 640x360 while
-        # the decoder produces 304x540). Conditional scaling then lets a
-        # mismatched stream reach concat and causes filter initialization to
-        # fail. Scaling every input also normalizes SAR before concatenation.
+        # Normalize every decoded stream. MoviePy's ``clip.size`` can disagree
+        # with ffmpeg's actual frame dimensions for rotated or portrait
+        # fragments, so conditional scaling is not sufficient.
         video_filter = (
             f'scale={width}:{height}:force_original_aspect_ratio=decrease,'
             f'pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,'
-            f'fps={TARGET_FPS},format=yuv420p,setpts=PTS-STARTPTS'
+            f'fps={TARGET_FPS},format=yuv420p,trim=duration={duration:.6f},'
+            f'setpts=PTS-STARTPTS+{max(0.0, start):.6f}/TB'
         )
         filters.append(f'[{index}:v]{video_filter}[{label}]')
-        video_labels.append(f'[{label}]')
-        current_time = max(current_time, start) + float(clip.duration)
-
-    if current_time < total_duration:
-        label = 'vgap_end'
         filters.append(
-            f'color=c=black:s={width}x{height}:r={TARGET_FPS}:d={total_duration - current_time},'
-            f'format=yuv420p[{label}]'
+            f'[{canvas_label}][{label}]overlay=eof_action=pass:repeatlast=0:shortest=0'
+            f'[vcanvas{overlay_index + 1}]'
         )
-        video_labels.append(f'[{label}]')
+        canvas_label = f'vcanvas{overlay_index + 1}'
+        overlay_index += 1
 
-    filters.append(''.join(video_labels) + f'concat=n={len(video_labels)}:v=1:a=0[vout]')
+    filters.append(f'[{canvas_label}]null[vout]')
     output_options = ['-map', '[vout]']
 
     if audio_clips:
