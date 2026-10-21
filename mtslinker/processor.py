@@ -10,7 +10,7 @@ import tqdm
 from moviepy.audio.AudioClip import AudioArrayClip, CompositeAudioClip
 from moviepy.audio.io.AudioFileClip import AudioFileClip
 from moviepy.video.VideoClip import ColorClip
-from moviepy import VideoFileClip, concatenate_videoclips
+from moviepy import CompositeVideoClip, VideoFileClip
 
 import warnings
 warnings.simplefilter("ignore")
@@ -113,7 +113,7 @@ def _select_video_encoder(target_bitrate_kbps):
     ]
 
 
-def _target_video_bitrate_kbps(video_clips):
+def _target_video_bitrate_kbps(video_clips, output_size=None):
     source_bitrates = []
     for clip in video_clips:
         reader = getattr(clip, 'reader', None)
@@ -126,7 +126,7 @@ def _target_video_bitrate_kbps(video_clips):
 
     # Use a resolution-aware floor so a low or missing source bitrate does not
     # turn a normal lecture recording into a blocky 450 kbps encode.
-    width, height = getattr(video_clips[0], 'size', (0, 0))
+    width, height = output_size or getattr(video_clips[0], 'size', (0, 0))
     pixels = int(width or 0) * int(height or 0)
     if pixels <= 640 * 360:
         quality_floor = 1200
@@ -160,6 +160,42 @@ def _audio_group(stream, fallback_index):
     return f'audio-source-{fallback_index}', 'Аудио'
 
 
+def _video_role(stream):
+    """Return the MTS stream role used to determine compositing priority."""
+    if isinstance(stream, dict):
+        if 'screensharing' in stream:
+            return 'screensharing'
+        if 'conference' in stream:
+            return 'conference'
+    return 'unknown'
+
+
+def _ordered_video_clips(video_clips):
+    """Order layers by MTS role, with a resolution-based metadata fallback."""
+    role_priority = {'conference': 0, 'unknown': 1, 'screensharing': 2}
+
+    def priority(clip):
+        role = getattr(clip, '_mts_video_role', 'unknown')
+        area = int(clip.w) * int(clip.h)
+        duration = float(getattr(clip, 'duration', 0) or 0)
+        return role_priority.get(role, 1), area, duration
+
+    return sorted(
+        video_clips,
+        key=priority,
+    )
+
+
+def _video_output_size(video_clips):
+    """Prefer the largest screen-sharing source for the output canvas."""
+    screen_shares = [
+        clip for clip in video_clips
+        if getattr(clip, '_mts_video_role', 'unknown') == 'screensharing'
+    ]
+    candidates = screen_shares or video_clips
+    return tuple(max(candidates, key=lambda clip: int(clip.w) * int(clip.h)).size)
+
+
 def process_video_clips(
     directory: str,
     json_data: Dict,
@@ -184,8 +220,20 @@ def process_video_clips(
     fragments_directory = os.path.join(directory, 'fragments')
     os.makedirs(fragments_directory, exist_ok=True)
     logging.info('Fragment directory: %s', fragments_directory)
+    progress_labels = []
+    for _, _, stream in events:
+        role = _video_role(stream)
+        if role == 'screensharing':
+            progress_labels.append('Screen sharing')
+        elif role == 'conference':
+            progress_labels.append('Conference')
+        else:
+            progress_labels.append('Other')
     downloaded_paths = download_video_chunks(
-        (url for url, _, _ in events), fragments_directory, max_workers=download_workers
+        (url for url, _, _ in events),
+        fragments_directory,
+        max_workers=download_workers,
+        progress_labels=progress_labels,
     )
     audio_source_index = 0
     for downloaded_file_path, (_, start_time, stream) in zip(downloaded_paths, events):
@@ -194,6 +242,7 @@ def process_video_clips(
             try:
                 video_clip = _set_clip_fps(_open_video_clip(downloaded_file_path), TARGET_FPS)
                 video_clip = video_clip.with_start(start_time)
+                video_clip._mts_video_role = _video_role(stream)
                 video_clips.append(video_clip)
                 continue
             except (KeyError, OSError, IndexError, ValueError, TypeError) as error:
@@ -220,33 +269,22 @@ def process_video_clips(
 
 
 def create_video_with_gaps(total_duration: float, video_clips: List[VideoFileClip]) -> VideoFileClip:
-    clips = []
-    current_time = 0.0
+    ordered_clips = _ordered_video_clips(video_clips)
+    output_size = _video_output_size(ordered_clips)
+    background = ColorClip(size=output_size, color=(0, 0, 0), duration=total_duration)
+    layers = [background]
+    for video in ordered_clips:
+        scale = min(output_size[0] / video.w, output_size[1] / video.h)
+        fitted = video
+        if abs(scale - 1.0) > 1e-6:
+            fitted = video.resized(new_size=(round(video.w * scale), round(video.h * scale)))
+        layers.append(fitted.with_position(('center', 'center')))
 
-    for video in video_clips:
-        if video.start > current_time:
-            gap_duration = video.start - current_time
-            if gap_duration > 0:
-                empty_clip = ColorClip(size=(1920, 1080), color=(0, 0, 0), duration=gap_duration).with_start(
-                    current_time)
-                clips.append(empty_clip)
-
-        clips.append(video)
-        current_time = video.end
-
-    if current_time < total_duration:
-        remaining_duration = total_duration - current_time
-        empty_clip = ColorClip(size=(1920, 1080), color=(0, 0, 0), duration=remaining_duration).with_start(current_time)
-        clips.append(empty_clip)
-
-    # ``compose`` composites every frame onto a canvas and is considerably
-    # slower. All clips produced by MTS Link normally have the same size, so
-    # use the direct frame chain in that case and retain compose as a safe
-    # fallback for recordings with mixed resolutions.
-    clip_sizes = {tuple(clip.size) for clip in clips}
-    concat_method = 'chain' if len(clip_sizes) == 1 else 'compose'
-    logging.info('Concatenating %d clips with method=%s.', len(clips), concat_method)
-    final_video = concatenate_videoclips(clips, method=concat_method)
+    logging.info(
+        'Compositing %d video streams on a %dx%d canvas; screen sharing has priority.',
+        len(ordered_clips), *output_size,
+    )
+    final_video = CompositeVideoClip(layers, size=output_size).with_duration(total_duration)
     logging.info(f'Final video duration: {final_video.duration}')
     return final_video
 
@@ -292,10 +330,22 @@ def compile_final_video_ffmpeg(
     if not video_clips:
         raise ValueError('No video clips available for ffmpeg rendering.')
 
-    target_bitrate_kbps = _target_video_bitrate_kbps(video_clips)
+    video_clips = _ordered_video_clips(video_clips)
+    width, height = _video_output_size(video_clips)
+    target_bitrate_kbps = _target_video_bitrate_kbps(video_clips, (width, height))
     video_encoder, encoder_options = _select_video_encoder(target_bitrate_kbps)
     logging.info('Using video encoder: %s at target bitrate %dkbps', video_encoder, target_bitrate_kbps)
-    width, height = video_clips[0].size
+    logging.info('Video canvas: %dx%d; screen sharing has compositing priority.', width, height)
+    for layer_index, clip in enumerate(video_clips):
+        logging.info(
+            'Video layer %d: role=%s, size=%dx%d, start=%.3fs, source=%s',
+            layer_index,
+            getattr(clip, '_mts_video_role', 'unknown'),
+            clip.w,
+            clip.h,
+            float(clip.start or 0),
+            os.path.basename(getattr(clip, 'filename', '') or '<generated>'),
+        )
     command = ['ffmpeg', '-y', '-loglevel', 'error']
     for clip in [*video_clips, *audio_clips]:
         filename = getattr(clip, 'filename', None)
